@@ -305,6 +305,15 @@ ExternalReference ExternalReference::sandbox_end_address() {
   return ExternalReference(Sandbox::current()->end_address());
 }
 
+ExternalReference ExternalReference::sandboxed_mode_pkey_mask_address() {
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+  return ExternalReference(
+      SandboxHardwareSupport::sandboxed_mode_pkey_mask_address());
+#else
+  return ExternalReference(kNullAddress);
+#endif
+}
+
 ExternalReference ExternalReference::empty_backing_store_buffer() {
   return ExternalReference(
       Sandbox::current()->constants().empty_backing_store_buffer_address());
@@ -555,10 +564,6 @@ FUNCTION_REFERENCE(allocate_and_initialize_young_external_pointer_table_entry,
 
 FUNCTION_REFERENCE(get_date_field_function, JSDate::GetField)
 
-ExternalReference ExternalReference::date_cache_stamp(Isolate* isolate) {
-  return ExternalReference(isolate->date_cache()->stamp_address());
-}
-
 // static
 ExternalReference
 ExternalReference::runtime_function_table_address_for_unittests(
@@ -603,8 +608,9 @@ FUNCTION_REFERENCE(ensure_valid_return_address,
 #endif  // V8_ENABLE_CET_SHADOW_STACK
 
 #ifdef V8_ENABLE_WEBASSEMBLY
-FUNCTION_REFERENCE(wasm_switch_stacks, wasm::switch_stacks)
-FUNCTION_REFERENCE(wasm_return_switch, wasm::return_switch)
+FUNCTION_REFERENCE(wasm_start_or_suspend_stack, wasm::start_or_suspend_stack)
+FUNCTION_REFERENCE(wasm_resume_stack, wasm::resume_stack)
+FUNCTION_REFERENCE(wasm_return_stack, wasm::return_stack)
 FUNCTION_REFERENCE(wasm_switch_to_the_central_stack,
                    wasm::switch_to_the_central_stack)
 FUNCTION_REFERENCE(wasm_switch_from_the_central_stack,
@@ -903,10 +909,6 @@ ExternalReference ExternalReference::additive_safe_int_feedback_flag() {
 #else
   return ExternalReference();
 #endif  // V8_TARGET_ARCH_64_BIT
-}
-
-ExternalReference ExternalReference::address_of_script_context_cells_flag() {
-  return ExternalReference(&v8_flags.script_context_cells);
 }
 
 ExternalReference ExternalReference::address_of_load_from_stack_count(
@@ -1446,6 +1448,12 @@ FUNCTION_REFERENCE(global_dictionary_lookup_forwarded_string,
 FUNCTION_REFERENCE(global_dictionary_find_insertion_entry_forwarded_string,
                    (NameDictionaryLookupForwardedStringWithHandle<
                        GlobalDictionary, kFindInsertionEntry>))
+FUNCTION_REFERENCE(simple_name_dictionary_lookup_forwarded_string,
+                   (NameDictionaryLookupForwardedStringWithHandle<
+                       SimpleNameDictionary, kFindExisting>))
+FUNCTION_REFERENCE(simple_name_dictionary_find_insertion_entry_forwarded_string,
+                   (NameDictionaryLookupForwardedStringWithHandle<
+                       SimpleNameDictionary, kFindInsertionEntry>))
 
 template <typename Dictionary, LookupMode mode>
 static size_t NameDictionaryLookupForwardedString(Isolate* isolate,

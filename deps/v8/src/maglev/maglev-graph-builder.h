@@ -12,6 +12,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/base/base-export.h"
 #include "src/base/hashing.h"
 #include "src/base/logging.h"
 #include "src/base/vector.h"
@@ -27,17 +28,20 @@
 #include "src/compiler/processed-feedback.h"
 #include "src/deoptimizer/deoptimize-reason.h"
 #include "src/flags/flags.h"
+#include "src/handles/traced-handles.h"
 #include "src/interpreter/bytecode-array-iterator.h"
 #include "src/interpreter/bytecode-decoder.h"
 #include "src/interpreter/bytecode-register.h"
 #include "src/interpreter/bytecodes.h"
 #include "src/interpreter/interpreter-intrinsics.h"
+#include "src/maglev/maglev-basic-block.h"
 #include "src/maglev/maglev-compilation-unit.h"
 #include "src/maglev/maglev-graph-labeller.h"
 #include "src/maglev/maglev-graph-printer.h"
 #include "src/maglev/maglev-graph.h"
 #include "src/maglev/maglev-interpreter-frame-state.h"
 #include "src/maglev/maglev-ir.h"
+#include "src/maglev/maglev-reducer.h"
 #include "src/objects/arguments.h"
 #include "src/objects/bytecode-array.h"
 #include "src/objects/elements-kind.h"
@@ -170,14 +174,10 @@ inline ReduceResult MaybeReduceResult::Checked() { return ReduceResult(*this); }
     variable = res.value()->Cast<T>();                                 \
   } while (false)
 
-enum class UseReprHintRecording { kRecord, kDoNotRecord };
-
-NodeType StaticTypeForNode(compiler::JSHeapBroker* broker,
-                           LocalIsolate* isolate, ValueNode* node);
-
 struct CatchBlockDetails {
   BasicBlockRef* ref = nullptr;
   bool exception_handler_was_used = false;
+  bool block_already_exists = false;
   int deopt_frame_distance = 0;
 };
 
@@ -232,9 +232,8 @@ class MaglevGraphBuilder {
     DCHECK(!is_inline());
 
     DCHECK_EQ(inlining_id_, SourcePosition::kNotInlined);
-    current_source_position_ = SourcePosition(
-        compilation_unit_->shared_function_info().StartPosition(),
-        inlining_id_);
+    reducer_.SetBytecodeOffset(entrypoint_);
+    reducer_.SetStartSourcePosition(inlining_id_);
 
     StartPrologue();
     for (int i = 0; i < parameter_count(); i++) {
@@ -255,7 +254,7 @@ class MaglevGraphBuilder {
     new (function_entry_stack_check->lazy_deopt_info()) LazyDeoptInfo(
         zone(), GetDeoptFrameForEntryStackCheck(),
         interpreter::Register::invalid_value(), 0, compiler::FeedbackSource());
-    AddInitializedNodeToGraph(function_entry_stack_check);
+    reducer_.AddInitializedNodeToGraph(function_entry_stack_check);
 
     BuildMergeStates();
     EndPrologue();
@@ -295,13 +294,13 @@ class MaglevGraphBuilder {
   void OsrAnalyzePrequel();
 
   void BuildBody() {
+    int position = 0;
     while (!source_position_iterator_.done() &&
            source_position_iterator_.code_offset() < entrypoint_) {
-      current_source_position_ = SourcePosition(
-          source_position_iterator_.source_position().ScriptOffset(),
-          inlining_id_);
+      position = source_position_iterator_.source_position().ScriptOffset();
       source_position_iterator_.Advance();
     }
+    reducer_.SetSourcePosition(position, inlining_id_);
     for (iterator_.SetOffset(entrypoint_); !iterator_.done();
          iterator_.Advance()) {
       local_isolate_->heap()->Safepoint();
@@ -319,79 +318,41 @@ class MaglevGraphBuilder {
   }
 
   SmiConstant* GetSmiConstant(int constant) const {
-    DCHECK(Smi::IsValid(constant));
-    auto it = graph_->smi().find(constant);
-    if (it == graph_->smi().end()) {
-      SmiConstant* node =
-          CreateNewConstantNode<SmiConstant>(0, Smi::FromInt(constant));
-      graph_->smi().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetSmiConstant(constant);
   }
-
   TaggedIndexConstant* GetTaggedIndexConstant(int constant) {
-    DCHECK(TaggedIndex::IsValid(constant));
-    auto it = graph_->tagged_index().find(constant);
-    if (it == graph_->tagged_index().end()) {
-      TaggedIndexConstant* node = CreateNewConstantNode<TaggedIndexConstant>(
-          0, TaggedIndex::FromIntptr(constant));
-      graph_->tagged_index().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetTaggedIndexConstant(constant);
   }
-
   Int32Constant* GetInt32Constant(int32_t constant) {
-    auto it = graph_->int32().find(constant);
-    if (it == graph_->int32().end()) {
-      Int32Constant* node = CreateNewConstantNode<Int32Constant>(0, constant);
-      graph_->int32().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetInt32Constant(constant);
   }
-
   IntPtrConstant* GetIntPtrConstant(intptr_t constant) {
-    auto it = graph_->intptr().find(constant);
-    if (it == graph_->intptr().end()) {
-      IntPtrConstant* node = CreateNewConstantNode<IntPtrConstant>(0, constant);
-      graph_->intptr().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetIntPtrConstant(constant);
   }
-
   Uint32Constant* GetUint32Constant(int constant) {
-    auto it = graph_->uint32().find(constant);
-    if (it == graph_->uint32().end()) {
-      Uint32Constant* node = CreateNewConstantNode<Uint32Constant>(0, constant);
-      graph_->uint32().emplace(constant, node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetUint32Constant(constant);
   }
-
   Float64Constant* GetFloat64Constant(double constant) {
-    return GetFloat64Constant(
-        Float64::FromBits(base::double_to_uint64(constant)));
+    return graph()->GetFloat64Constant(constant);
   }
-
   Float64Constant* GetFloat64Constant(Float64 constant) {
-    auto it = graph_->float64().find(constant.get_bits());
-    if (it == graph_->float64().end()) {
-      Float64Constant* node =
-          CreateNewConstantNode<Float64Constant>(0, constant);
-      graph_->float64().emplace(constant.get_bits(), node);
-      return node;
-    }
-    return it->second;
+    return graph()->GetFloat64Constant(constant);
+  }
+  RootConstant* GetRootConstant(RootIndex index) {
+    return graph()->GetRootConstant(index);
+  }
+  RootConstant* GetBooleanConstant(bool value) {
+    return graph()->GetBooleanConstant(value);
+  }
+  ValueNode* GetConstant(compiler::ObjectRef ref) {
+    return graph()->GetConstant(ref);
+  }
+  ValueNode* GetTrustedConstant(compiler::HeapObjectRef ref,
+                                IndirectPointerTag tag) {
+    return graph()->GetTrustedConstant(ref, tag);
   }
 
   ValueNode* GetNumberConstant(double constant);
-
-  static compiler::OptionalHeapObjectRef TryGetConstant(
-      compiler::JSHeapBroker* broker, LocalIsolate* isolate, ValueNode* node);
 
   Graph* graph() const { return graph_; }
   Zone* zone() const { return compilation_unit_->zone(); }
@@ -406,12 +367,13 @@ class MaglevGraphBuilder {
   compiler::JSHeapBroker* broker() const { return broker_; }
   LocalIsolate* local_isolate() const { return local_isolate_; }
 
-  bool has_graph_labeller() const {
-    return compilation_unit_->has_graph_labeller();
-  }
+  bool has_graph_labeller() const { return graph_->has_graph_labeller(); }
   MaglevGraphLabeller* graph_labeller() const {
-    return compilation_unit_->graph_labeller();
+    if (graph_->has_graph_labeller()) return graph_->graph_labeller();
+    return nullptr;
   }
+
+  MaglevReducer<MaglevGraphBuilder>& reducer() { return reducer_; }
 
   // True when this graph builder is building the subgraph of an inlined
   // function.
@@ -427,6 +389,11 @@ class MaglevGraphBuilder {
   }
 
   DeoptFrame GetLatestCheckpointedFrame();
+  DeoptFrame GetDeoptFrameForEagerDeopt() {
+    return GetLatestCheckpointedFrame();
+  }
+  std::tuple<DeoptFrame, interpreter::Register, int>
+  GetDeoptFrameForLazyDeopt();
 
   bool need_checkpointed_loop_entry() {
     return v8_flags.maglev_speculative_hoist_phi_untagging ||
@@ -447,11 +414,16 @@ class MaglevGraphBuilder {
     }
   }
 
-  void set_current_block(BasicBlock* block) { current_block_ = block; }
+  SourcePosition GetCurrentSourcePosition() const {
+    return reducer_.current_provenance().position;
+  }
+
+  BasicBlock* current_block() const { return reducer_.current_block(); }
+  void set_current_block(BasicBlock* block) {
+    reducer_.set_current_block(block);
+  }
   BasicBlock* FinishInlinedBlockForCaller(
       ControlNode* control_node, ZoneVector<Node*> rem_nodes_in_call_block);
-
-  ZoneVector<Node*>& node_buffer() { return graph_->node_buffer(); }
 
   uint32_t NewObjectId() { return graph_->NewObjectId(); }
 
@@ -494,11 +466,153 @@ class MaglevGraphBuilder {
       return v8_flags.max_maglev_inlined_bytecode_size_cumulative;
     }
   }
+  int max_inline_depth() {
+    if (is_turbolev()) {
+      // This is just to avoid some corner cases, especially since we allow
+      // recursive inlining.
+      constexpr int kMaxDepthForInlining = 50;
+      return kMaxDepthForInlining;
+    } else {
+      return v8_flags.max_maglev_inline_depth;
+    }
+  }
+
+  KnownNodeAspects& known_node_aspects() {
+    return *current_interpreter_frame_.known_node_aspects();
+  }
 
   DeoptFrame* AddInlinedArgumentsToDeoptFrame(DeoptFrame* deopt_frame,
                                               const MaglevCompilationUnit* unit,
                                               ValueNode* closure,
                                               base::Vector<ValueNode*> args);
+
+  std::pair<interpreter::Register, int> GetResultLocationAndSize() const;
+
+  void AttachExceptionHandlerInfo(Node* node) {
+    CatchBlockDetails catch_block = GetCurrentTryCatchBlock();
+    if (catch_block.ref) {
+      if (!catch_block.exception_handler_was_used) {
+        // Attach an empty live exception handler to mark that there's a
+        // matching catch but we'll lazy deopt if we ever throw.
+        new (node->exception_handler_info())
+            ExceptionHandlerInfo(ExceptionHandlerInfo::kLazyDeopt);
+        DCHECK(node->exception_handler_info()->HasExceptionHandler());
+        DCHECK(node->exception_handler_info()->ShouldLazyDeopt());
+        if (node->Is<CallKnownJSFunction>()) {
+          if (is_non_eager_inlining_enabled()) {
+            // Ensure that we always have the handler of inline call
+            // candidates.
+            current_block()->AddExceptionHandler(
+                node->exception_handler_info());
+          }
+        }
+        return;
+      }
+
+      DCHECK_IMPLIES(!IsInsideTryBlock(), is_inline());
+      if (catch_block.block_already_exists) {
+        DCHECK(!IsInsideTryBlock());
+        // If we are inlining a function non-eagerly and we are not inside a
+        // try block, then the catch block already exists.
+        new (node->exception_handler_info()) ExceptionHandlerInfo(
+            catch_block.ref->block_ptr(), catch_block.deopt_frame_distance);
+      } else {
+        // If we are inside a try block for the current builder or if we are
+        // inside an eager inlined call inside a try block, the catch basic
+        // block doesn't exist yet, use the ref-list mechanism.
+        new (node->exception_handler_info()) ExceptionHandlerInfo(
+            catch_block.ref, catch_block.deopt_frame_distance);
+      }
+
+      DCHECK(node->exception_handler_info()->HasExceptionHandler());
+      DCHECK(!node->exception_handler_info()->ShouldLazyDeopt());
+
+      current_block()->AddExceptionHandler(node->exception_handler_info());
+
+      if (IsInsideTryBlock()) {
+        // Merge the current state into the handler state.
+        auto state = GetCatchBlockFrameState();
+        DCHECK_NOT_NULL(state);
+        state->MergeThrow(this, compilation_unit_,
+                          *current_interpreter_frame_.known_node_aspects(),
+                          current_interpreter_frame_.virtual_objects());
+      }
+    } else {
+      // Patch no exception handler marker.
+      // TODO(victorgomes): Avoid allocating exception handler data in this
+      // case.
+      new (node->exception_handler_info()) ExceptionHandlerInfo();
+      DCHECK(!node->exception_handler_info()->HasExceptionHandler());
+      if (node->Is<CallKnownJSFunction>()) {
+        if (is_non_eager_inlining_enabled()) {
+          // Ensure that we always have the handler of inline call candidates.
+          current_block()->AddExceptionHandler(node->exception_handler_info());
+        }
+      }
+    }
+  }
+
+  template <typename NodeT>
+  void MarkPossibleSideEffect(NodeT* node) {
+    if constexpr (NodeT::kProperties.can_read() ||
+                  NodeT::kProperties.can_deopt() ||
+                  NodeT::kProperties.can_throw()) {
+      unobserved_context_slot_stores_.clear();
+    }
+
+    if constexpr (Node::opcode_of<NodeT> != Opcode::kAllocationBlock &&
+                  (NodeT::kProperties.can_deopt() ||
+                   NodeT::kProperties.can_throw() ||
+                   NodeT::kProperties.can_allocate())) {
+      ClearCurrentAllocationBlock();
+    }
+
+    // Don't do anything for nodes without side effects.
+    if constexpr (!NodeT::kProperties.can_write()) return;
+
+    // We only need to clear unstable node aspects on the current builder, not
+    // the parent, since we'll anyway copy the known_node_aspects to the parent
+    // once we finish the inlined function.
+
+    if constexpr (IsElementsArrayWrite(Node::opcode_of<NodeT>)) {
+      node->ClearElementsProperties(known_node_aspects());
+      if (is_loop_effect_tracking()) {
+        loop_effects_->keys_cleared.insert(
+            KnownNodeAspects::LoadedPropertyMapKey::Elements());
+      }
+    } else if constexpr (!IsSimpleFieldStore(Node::opcode_of<NodeT>) &&
+                         !IsTypedArrayStore(Node::opcode_of<NodeT>)) {
+      // Don't change known node aspects for simple field stores. The only
+      // relevant side effect on these is writes to objects which invalidate
+      // loaded properties and context slots, and we invalidate these already as
+      // part of emitting the store.
+      node->ClearUnstableNodeAspects(known_node_aspects());
+      if (is_loop_effect_tracking()) {
+        loop_effects_->unstable_aspects_cleared = true;
+      }
+    }
+
+    // Simple field stores can't possibly change or migrate the map.
+    static constexpr bool is_possible_map_change =
+        !IsSimpleFieldStore(Node::opcode_of<NodeT>);
+
+    // All user-observable side effects need to clear state that is cached on
+    // the builder. This reset has to be propagated up through the parents.
+    // TODO(leszeks): What side effects aren't observable? Maybe migrations?
+    ResetBuilderCachedState<is_possible_map_change>();
+  }
+
+  template <bool is_possible_map_change = true>
+  void ResetBuilderCachedState() {
+    latest_checkpointed_frame_.reset();
+
+    // If a map might have changed, then we need to re-check it for for-in.
+    // TODO(leszeks): Track this on merge states / known node aspects, rather
+    // than on the graph, so that it can survive control flow.
+    if constexpr (is_possible_map_change) {
+      current_for_in_state.receiver_needs_map_check = true;
+    }
+  }
 
  private:
   // Helper class for building a subgraph with its own control flow, that is not
@@ -556,24 +670,34 @@ class MaglevGraphBuilder {
   class CallSpeculationScope;
   class SaveCallSpeculationScope;
 
-  bool CheckStaticType(ValueNode* node, NodeType type, NodeType* old = nullptr);
-  bool CheckType(ValueNode* node, NodeType type, NodeType* old = nullptr);
-  NodeType CheckTypes(ValueNode* node, std::initializer_list<NodeType> types);
-  bool EnsureType(ValueNode* node, NodeType type, NodeType* old = nullptr);
-  NodeType GetType(ValueNode* node);
-  NodeInfo* GetOrCreateInfoFor(ValueNode* node) {
-    return known_node_aspects().GetOrCreateInfoFor(node, broker(),
-                                                   local_isolate());
+  bool CheckType(ValueNode* node, NodeType type, NodeType* old = nullptr) {
+    return known_node_aspects().CheckType(broker(), node, type, old);
   }
-
+  NodeType CheckTypes(ValueNode* node, std::initializer_list<NodeType> types) {
+    return known_node_aspects().CheckTypes(broker(), node, types);
+  }
+  bool EnsureType(ValueNode* node, NodeType type, NodeType* old = nullptr) {
+    return known_node_aspects().EnsureType(broker(), node, type, old);
+  }
+  template <typename Function>
+  bool EnsureType(ValueNode* node, NodeType type, Function ensure_new_type) {
+    return known_node_aspects().EnsureType<Function>(broker(), node, type,
+                                                     ensure_new_type);
+  }
+  NodeType GetType(ValueNode* node) {
+    return known_node_aspects().GetType(broker(), node);
+  }
+  NodeInfo* GetOrCreateInfoFor(ValueNode* node) {
+    return known_node_aspects().GetOrCreateInfoFor(broker(), node);
+  }
   // Returns true if we statically know that {lhs} and {rhs} have disjoint
   // types.
-  bool HaveDisjointTypes(ValueNode* lhs, ValueNode* rhs);
-  bool HasDisjointType(ValueNode* lhs, NodeType rhs_type);
-
-  template <typename Function>
-  bool EnsureType(ValueNode* node, NodeType type, Function ensure_new_type);
-  bool MayBeNullOrUndefined(ValueNode* node);
+  bool HaveDisjointTypes(ValueNode* lhs, ValueNode* rhs) {
+    return known_node_aspects().HaveDisjointTypes(broker(), lhs, rhs);
+  }
+  bool HasDisjointType(ValueNode* lhs, NodeType rhs_type) {
+    return known_node_aspects().HasDisjointType(broker(), lhs, rhs_type);
+  }
 
   void SetKnownValue(ValueNode* node, compiler::ObjectRef constant,
                      NodeType new_node_type);
@@ -616,8 +740,8 @@ class MaglevGraphBuilder {
       std::cout << "== New empty block ==" << std::endl;
       PrintVirtualObjects();
     }
-    DCHECK_NULL(current_block_);
-    current_block_ = zone()->New<BasicBlock>(nullptr, zone());
+    DCHECK_NULL(current_block());
+    set_current_block(zone()->New<BasicBlock>(nullptr, zone()));
     BasicBlock* result = FinishBlock<Jump>({}, &jump_targets);
     result->set_edge_split_block(predecessor);
 #ifdef DEBUG
@@ -646,9 +770,7 @@ class MaglevGraphBuilder {
     // Register exception phis.
     if (has_graph_labeller()) {
       for (Phi* phi : *merge_states_[offset]->phis()) {
-        graph_labeller()->RegisterNode(phi, compilation_unit_,
-                                       BytecodeOffset(offset),
-                                       current_source_position_);
+        graph_labeller()->RegisterNode(phi);
         if (v8_flags.trace_maglev_graph_building) {
           std::cout << "  " << phi << "  "
                     << PrintNodeLabel(graph_labeller(), phi) << ": "
@@ -742,12 +864,17 @@ class MaglevGraphBuilder {
     return merge_states_[offset] != nullptr;
   }
 
+  bool IsOffsetAMergePointOrLoopHeapder(int offset) {
+    return IsOffsetAMergePoint(offset) ||
+           bytecode_analysis().IsLoopHeader(offset);
+  }
+
   ValueNode* GetContextAtDepth(ValueNode* context, size_t depth);
   bool CheckContextExtensions(size_t depth);
 
   // Called when a block is killed by an unconditional eager deopt.
   ReduceResult EmitUnconditionalDeopt(DeoptimizeReason reason) {
-    current_block_->set_deferred(true);
+    current_block()->set_deferred(true);
     // Create a block rather than calling finish, since we don't yet know the
     // next block's offset before the loop skipping the rest of the bytecodes.
     FinishBlock<Deopt>({}, reason);
@@ -784,7 +911,7 @@ class MaglevGraphBuilder {
   }
 
   void MarkBytecodeDead() {
-    DCHECK_NULL(current_block_);
+    DCHECK_NULL(current_block());
     if (v8_flags.trace_maglev_graph_building) {
       std::cout << "== Dead ==\n"
                 << std::setw(4) << iterator_.current_offset() << " : ";
@@ -830,7 +957,8 @@ class MaglevGraphBuilder {
   void UpdateSourceAndBytecodePosition(int offset) {
     if (source_position_iterator_.done()) return;
     if (source_position_iterator_.code_offset() == offset) {
-      current_source_position_ = SourcePosition(
+      reducer_.SetBytecodeOffset(iterator_.current_offset());
+      reducer_.SetSourcePosition(
           source_position_iterator_.source_position().ScriptOffset(),
           inlining_id_);
       source_position_iterator_.Advance();
@@ -842,8 +970,7 @@ class MaglevGraphBuilder {
   void PrintVirtualObjects() {
     if (!v8_flags.trace_maglev_graph_building) return;
     current_interpreter_frame_.virtual_objects().Print(
-        std::cout, "* VOs (Interpreter Frame State): ",
-        compilation_unit()->graph_labeller());
+        std::cout, "* VOs (Interpreter Frame State): ", graph_labeller());
   }
 
   void VisitSingleBytecode() {
@@ -864,7 +991,7 @@ class MaglevGraphBuilder {
       if (merge_state->is_resumable_loop()) {
         current_for_in_state.enum_cache_indices = nullptr;
       }
-      if (current_block_ != nullptr) {
+      if (current_block() != nullptr) {
         DCHECK(!preserve_known_node_aspects);
         // TODO(leszeks): Re-evaluate this DCHECK, we might hit it if the only
         // bytecodes in this basic block were only register juggling.
@@ -919,7 +1046,7 @@ class MaglevGraphBuilder {
       // this block is guaranteed to have a merge_state_, and hence to not have
       // a `predecessor_` field.
       StartNewBlock(offset, /*predecessor*/ nullptr);
-    } else if (V8_UNLIKELY(current_block_ == nullptr)) {
+    } else if (V8_UNLIKELY(current_block() == nullptr)) {
       // If we don't have a current block, the bytecode must be dead (because of
       // some earlier deopt). Mark this bytecode dead too and return.
       // TODO(leszeks): Merge these two conditions by marking dead states with
@@ -960,7 +1087,7 @@ class MaglevGraphBuilder {
       }
     }
 
-    DCHECK_NOT_NULL(current_block_);
+    DCHECK_NOT_NULL(current_block());
 #ifdef DEBUG
     // Clear new nodes for the next VisitFoo
     new_nodes_.clear();
@@ -997,23 +1124,15 @@ class MaglevGraphBuilder {
   INTRINSICS_LIST(DECLARE_VISITOR)
 #undef DECLARE_VISITOR
 
-  void AddInitializedNodeToGraph(Node* node) {
-    // VirtualObjects should never be add to the Maglev graph.
-    DCHECK(!node->Is<VirtualObject>());
-    node_buffer().push_back(node);
-    node->set_owner(current_block_);
-    if (has_graph_labeller())
-      graph_labeller()->RegisterNode(node, compilation_unit_,
-                                     BytecodeOffset(iterator_.current_offset()),
-                                     current_source_position_);
-    if (v8_flags.trace_maglev_graph_building) {
+  void TraceNewNode(Node* node) {
+#ifdef DEBUG
+    if (V8_UNLIKELY(v8_flags.trace_maglev_graph_building)) {
       std::cout << "  " << node << "  "
                 << PrintNodeLabel(graph_labeller(), node) << ": "
                 << PrintNode(graph_labeller(), node) << std::endl;
     }
-#ifdef DEBUG
     new_nodes_.insert(node);
-#endif
+#endif  // DEBUG
   }
 
   // Add a new node with a dynamic set of inputs which are initialized by the
@@ -1022,156 +1141,20 @@ class MaglevGraphBuilder {
   template <typename NodeT, typename Function, typename... Args>
   NodeT* AddNewNode(size_t input_count,
                     Function&& post_create_input_initializer, Args&&... args) {
-    NodeT* node =
-        NodeBase::New<NodeT>(zone(), input_count, std::forward<Args>(args)...);
-    post_create_input_initializer(node);
-    return AttachExtraInfoAndAddToGraph(node);
-  }
-
-  template <typename NodeT, typename... Args>
-  NodeT* AddNewNodeOrGetEquivalent(std::initializer_list<ValueNode*> raw_inputs,
-                                   Args&&... args) {
-    DCHECK(v8_flags.maglev_cse);
-    static constexpr Opcode op = Node::opcode_of<NodeT>;
-    static_assert(Node::participate_in_cse(op));
-    using options_result =
-        typename std::invoke_result<decltype(&NodeT::options),
-                                    const NodeT>::type;
-    static_assert(
-        std::is_assignable<options_result, std::tuple<Args...>>::value,
-        "Instruction participating in CSE needs options() returning "
-        "a tuple matching the constructor arguments");
-    static_assert(IsFixedInputNode<NodeT>());
-    static_assert(NodeT::kInputCount <= 3);
-
-    std::array<ValueNode*, NodeT::kInputCount> inputs;
-    // Nodes with zero input count don't have kInputTypes defined.
-    if constexpr (NodeT::kInputCount > 0) {
-      int i = 0;
-      constexpr UseReprHintRecording hint = ShouldRecordUseReprHint<NodeT>();
-      for (ValueNode* raw_input : raw_inputs) {
-        // TODO(marja): Here we might already have the empty type for the
-        // node. Generate a deopt and make callers handle it.
-        inputs[i] = ConvertInputTo<hint>(raw_input, NodeT::kInputTypes[i]);
-        i++;
-      }
-      if constexpr (IsCommutativeNode(Node::opcode_of<NodeT>)) {
-        static_assert(NodeT::kInputCount == 2);
-        if ((IsConstantNode(inputs[0]->opcode()) || inputs[0] > inputs[1]) &&
-            !IsConstantNode(inputs[1]->opcode())) {
-          std::swap(inputs[0], inputs[1]);
-        }
-      }
-    }
-
-    uint32_t value_number;
-    {
-      size_t tmp_value_number = base::hash_value(op);
-      (
-          [&] {
-            tmp_value_number =
-                fast_hash_combine(tmp_value_number, gvn_hash_value(args));
-          }(),
-          ...);
-      for (const auto& inp : inputs) {
-        tmp_value_number =
-            fast_hash_combine(tmp_value_number, base::hash_value(inp));
-      }
-      value_number = static_cast<uint32_t>(tmp_value_number);
-    }
-
-    auto exists = known_node_aspects().available_expressions.find(value_number);
-    if (exists != known_node_aspects().available_expressions.end()) {
-      auto candidate = exists->second.node;
-      const bool sanity_check =
-          candidate->Is<NodeT>() &&
-          static_cast<size_t>(candidate->input_count()) == inputs.size();
-      DCHECK_IMPLIES(sanity_check,
-                     (StaticPropertiesForOpcode(op) &
-                      candidate->properties()) == candidate->properties());
-      const bool epoch_check =
-          !Node::needs_epoch_check(op) ||
-          known_node_aspects().effect_epoch() <= exists->second.effect_epoch;
-      if (sanity_check && epoch_check) {
-        if (static_cast<NodeT*>(candidate)->options() ==
-            std::tuple{std::forward<Args>(args)...}) {
-          int i = 0;
-          for (const auto& inp : inputs) {
-            if (inp != candidate->input(i).node()) {
-              break;
-            }
-            i++;
-          }
-          if (static_cast<size_t>(i) == inputs.size()) {
-            return static_cast<NodeT*>(candidate);
-          }
-        }
-      }
-      if (!epoch_check) {
-        known_node_aspects().available_expressions.erase(exists);
-      }
-    }
-    NodeT* node = NodeBase::New<NodeT>(zone(), inputs.size(),
-                                       std::forward<Args>(args)...);
-    int i = 0;
-    for (ValueNode* input : inputs) {
-      DCHECK_NOT_NULL(input);
-      node->set_input(i++, input);
-    }
-    DCHECK_EQ(node->options(), std::tuple{std::forward<Args>(args)...});
-    uint32_t epoch = Node::needs_epoch_check(op)
-                         ? known_node_aspects().effect_epoch()
-                         : KnownNodeAspects::kEffectEpochForPureInstructions;
-    if (epoch != KnownNodeAspects::kEffectEpochOverflow) {
-      known_node_aspects().available_expressions[value_number] = {node, epoch};
-    }
-    return AttachExtraInfoAndAddToGraph(node);
+    NodeT* node = reducer_.AddNewNode<NodeT>(
+        input_count, std::move(post_create_input_initializer),
+        std::forward<Args>(args)...);
+    TraceNewNode(node);
+    MarkPossibleSideEffect(node);
+    return node;
   }
 
   // Add a new node with a static set of inputs.
   template <typename NodeT, typename... Args>
   NodeT* AddNewNode(std::initializer_list<ValueNode*> inputs, Args&&... args) {
-    static_assert(IsFixedInputNode<NodeT>());
-    if constexpr (Node::participate_in_cse(Node::opcode_of<NodeT>)) {
-      if (v8_flags.maglev_cse) {
-        return AddNewNodeOrGetEquivalent<NodeT>(inputs,
-                                                std::forward<Args>(args)...);
-      }
-    }
-    NodeT* node = NodeBase::New<NodeT>(zone(), inputs.size(),
-                                       std::forward<Args>(args)...);
-    SetNodeInputs(node, inputs);
-    return AttachExtraInfoAndAddToGraph(node);
-  }
-
-  template <typename NodeT, typename... Args>
-  NodeT* CreateNewConstantNode(Args&&... args) const {
-    static_assert(IsConstantNode(Node::opcode_of<NodeT>));
-    NodeT* node = NodeBase::New<NodeT>(zone(), std::forward<Args>(args)...);
-    static_assert(!NodeT::kProperties.can_eager_deopt());
-    static_assert(!NodeT::kProperties.can_lazy_deopt());
-    static_assert(!NodeT::kProperties.can_throw());
-    static_assert(!NodeT::kProperties.can_write());
-    if (has_graph_labeller()) graph_labeller()->RegisterNode(node);
-    if (v8_flags.trace_maglev_graph_building) {
-      std::cout << "  " << node << "  "
-                << PrintNodeLabel(graph_labeller(), node) << ": "
-                << PrintNode(graph_labeller(), node) << std::endl;
-    }
-    return node;
-  }
-
-  template <typename NodeT>
-  NodeT* AttachExtraInfoAndAddToGraph(NodeT* node) {
-    static_assert(NodeT::kProperties.is_deopt_checkpoint() +
-                      NodeT::kProperties.can_eager_deopt() +
-                      NodeT::kProperties.can_lazy_deopt() <=
-                  1);
-    AttachDeoptCheckpoint(node);
-    AttachEagerDeoptInfo(node);
-    AttachLazyDeoptInfo(node);
-    AttachExceptionHandlerInfo(node);
-    AddInitializedNodeToGraph(node);
+    NodeT* node =
+        reducer_.AddNewNode<NodeT>(inputs, std::forward<Args>(args)...);
+    TraceNewNode(node);
     MarkPossibleSideEffect(node);
     return node;
   }
@@ -1187,90 +1170,7 @@ class MaglevGraphBuilder {
   void AttachEagerDeoptInfo(NodeT* node) {
     if constexpr (NodeT::kProperties.can_eager_deopt()) {
       node->SetEagerDeoptInfo(zone(), GetLatestCheckpointedFrame(),
-                              current_speculation_feedback_);
-    }
-  }
-
-  template <typename NodeT>
-  void AttachLazyDeoptInfo(NodeT* node) {
-    if constexpr (NodeT::kProperties.can_lazy_deopt()) {
-      interpreter::Register result_location;
-      int result_size;
-      if (lazy_deopt_result_location_scope_) {
-        result_location = lazy_deopt_result_location_scope_->result_location();
-        result_size = lazy_deopt_result_location_scope_->result_size();
-      } else {
-        std::tie(result_location, result_size) = GetResultLocationAndSize();
-      }
-      new (node->lazy_deopt_info()) LazyDeoptInfo(
-          zone(), GetDeoptFrameForLazyDeopt(result_location, result_size),
-          result_location, result_size, current_speculation_feedback_);
-    }
-  }
-
-  template <typename NodeT>
-  void AttachExceptionHandlerInfo(NodeT* node) {
-    if constexpr (NodeT::kProperties.can_throw()) {
-      CatchBlockDetails catch_block = GetCurrentTryCatchBlock();
-      if (catch_block.ref) {
-        if (!catch_block.exception_handler_was_used) {
-          // Attach an empty live exception handler to mark that there's a
-          // matching catch but we'll lazy deopt if we ever throw.
-          new (node->exception_handler_info())
-              ExceptionHandlerInfo(ExceptionHandlerInfo::kLazyDeopt);
-          DCHECK(node->exception_handler_info()->HasExceptionHandler());
-          DCHECK(node->exception_handler_info()->ShouldLazyDeopt());
-          if constexpr (std ::is_same_v<NodeT, CallKnownJSFunction>) {
-            if (is_non_eager_inlining_enabled()) {
-              // Ensure that we always have the handler of inline call
-              // candidates.
-              current_block_->AddExceptionHandler(
-                  node->exception_handler_info());
-            }
-          }
-          return;
-        }
-
-        DCHECK_IMPLIES(!IsInsideTryBlock(), is_inline());
-        if (!IsInsideTryBlock() && !is_eager_inline()) {
-          // If we are inlining a function non-eagerly and we are not inside a
-          // try block, then the catch block already exists.
-          new (node->exception_handler_info()) ExceptionHandlerInfo(
-              catch_block.ref->block_ptr(), catch_block.deopt_frame_distance);
-        } else {
-          // If we are inside a try block for the current builder or if we are
-          // inside an eager inlined call inside a try block, the catch basic
-          // block doesn't exist yet, use the ref-list mechanism.
-          new (node->exception_handler_info()) ExceptionHandlerInfo(
-              catch_block.ref, catch_block.deopt_frame_distance);
-        }
-
-        DCHECK(node->exception_handler_info()->HasExceptionHandler());
-        DCHECK(!node->exception_handler_info()->ShouldLazyDeopt());
-
-        current_block_->AddExceptionHandler(node->exception_handler_info());
-
-        if (IsInsideTryBlock()) {
-          // Merge the current state into the handler state.
-          auto state = GetCatchBlockFrameState();
-          DCHECK_NOT_NULL(state);
-          state->MergeThrow(this, compilation_unit_,
-                            *current_interpreter_frame_.known_node_aspects(),
-                            current_interpreter_frame_.virtual_objects());
-        }
-      } else {
-        // Patch no exception handler marker.
-        // TODO(victorgomes): Avoid allocating exception handler data in this
-        // case.
-        new (node->exception_handler_info()) ExceptionHandlerInfo();
-        DCHECK(!node->exception_handler_info()->HasExceptionHandler());
-        if constexpr (std ::is_same_v<NodeT, CallKnownJSFunction>) {
-          if (is_non_eager_inlining_enabled()) {
-            // Ensure that we always have the handler of inline call candidates.
-            current_block_->AddExceptionHandler(node->exception_handler_info());
-          }
-        }
-      }
+                              current_speculation_feedback());
     }
   }
 
@@ -1288,7 +1188,7 @@ class MaglevGraphBuilder {
       // Inside a try-block.
       int offset = catch_block_stack_.top().handler;
       return {&jump_targets_[offset],
-              merge_states_[offset]->exception_handler_was_used(), 0};
+              merge_states_[offset]->exception_handler_was_used(), false, 0};
     }
     if (!is_inline()) {
       return CatchBlockDetails{};
@@ -1296,14 +1196,20 @@ class MaglevGraphBuilder {
     return caller_details_->catch_block;
   }
 
-  CatchBlockDetails GetTryCatchBlockFromInfo(ExceptionHandlerInfo* info) {
+  CatchBlockDetails GetTryCatchBlockForNonEagerInlining(
+      ExceptionHandlerInfo* info) {
     if (IsInsideTryBlock()) {
-      return {info->catch_block_ref_address(), !info->ShouldLazyDeopt(), 0};
+      return {info->catch_block_ref_address(), !info->ShouldLazyDeopt(), true,
+              0};
     }
     if (!is_inline()) {
       return CatchBlockDetails{};
     }
-    return caller_details_->catch_block;
+    // Since this CatchBlockDetails is stored in a non-eager call site,
+    // the catch block will already exist by the time inlining is attempted.
+    CatchBlockDetails catch_details = caller_details_->catch_block;
+    catch_details.block_already_exists = true;
+    return catch_details;
   }
 
   bool ContextMayAlias(ValueNode* context,
@@ -1447,7 +1353,7 @@ class MaglevGraphBuilder {
     Handle<String> string_handle =
         local_isolate()->factory()->NewStringFromAsciiChecked(
             str, AllocationType::kOld);
-    ValueNode* string_node = GetConstant(MakeRefAssumeMemoryFence(
+    ValueNode* string_node = graph()->GetConstant(MakeRefAssumeMemoryFence(
         broker(), broker()->CanonicalPersistentHandle(string_handle)));
     CHECK(BuildCallRuntime(Runtime::kGlobalPrint, {string_node}).IsDone());
   }
@@ -1462,7 +1368,7 @@ class MaglevGraphBuilder {
   }
 
   ValueNode* GetFeedbackCell() {
-    return GetConstant(
+    return graph()->GetConstant(
         compilation_unit_->GetTopLevelCompilationUnit()->feedback_cell());
   }
 
@@ -1505,36 +1411,7 @@ class MaglevGraphBuilder {
                           operand_index, local_isolate()))));
   }
 
-  ExternalConstant* GetExternalConstant(ExternalReference reference) {
-    auto it = graph_->external_references().find(reference.address());
-    if (it == graph_->external_references().end()) {
-      ExternalConstant* node =
-          CreateNewConstantNode<ExternalConstant>(0, reference);
-      graph_->external_references().emplace(reference.address(), node);
-      return node;
-    }
-    return it->second;
-  }
-
-  RootConstant* GetRootConstant(RootIndex index) {
-    auto it = graph_->root().find(index);
-    if (it == graph_->root().end()) {
-      RootConstant* node = CreateNewConstantNode<RootConstant>(0, index);
-      graph_->root().emplace(index, node);
-      return node;
-    }
-    return it->second;
-  }
-
-  RootConstant* GetBooleanConstant(bool value) {
-    return GetRootConstant(value ? RootIndex::kTrueValue
-                                 : RootIndex::kFalseValue);
-  }
-
-  ValueNode* GetConstant(compiler::ObjectRef ref);
-
-  ValueNode* GetTrustedConstant(compiler::HeapObjectRef ref,
-                                IndirectPointerTag tag);
+  MaybeReduceResult GetConstantSingleCharacterStringFromCode(uint16_t);
 
   ValueNode* GetRegisterInput(Register reg) {
     DCHECK(!graph_->register_inputs().has(reg));
@@ -1565,7 +1442,10 @@ class MaglevGraphBuilder {
 
   ValueNode* GetTaggedValue(ValueNode* value,
                             UseReprHintRecording record_use_repr_hint =
-                                UseReprHintRecording::kRecord);
+                                UseReprHintRecording::kRecord) {
+    return reducer_.GetTaggedValue(value, record_use_repr_hint);
+  }
+
   ReduceResult GetSmiValue(ValueNode* value,
                            UseReprHintRecording record_use_repr_hint =
                                UseReprHintRecording::kRecord);
@@ -1615,14 +1495,18 @@ class MaglevGraphBuilder {
     return GetUint8ClampedForToNumber(current_interpreter_frame_.get(reg));
   }
 
-  std::optional<int32_t> TryGetInt32Constant(ValueNode* value);
+  std::optional<int32_t> TryGetInt32Constant(ValueNode* value) {
+    return reducer_.TryGetInt32Constant(value);
+  }
   std::optional<uint32_t> TryGetUint32Constant(ValueNode* value);
 
   // Get an Int32 representation node whose value is equivalent to the given
   // node.
   //
   // Deopts if the value is not exactly representable as an Int32.
-  ValueNode* GetInt32(ValueNode* value, bool can_be_heap_number = false);
+  ValueNode* GetInt32(ValueNode* value, bool can_be_heap_number = false) {
+    return reducer_.GetInt32(value, can_be_heap_number);
+  }
 
   void EnsureInt32(ValueNode* value, bool can_be_heap_number = false) {
     // Either the value is Int32 already, or we force a conversion to Int32 and
@@ -1635,17 +1519,25 @@ class MaglevGraphBuilder {
   }
 
   std::optional<double> TryGetFloat64Constant(
-      ValueNode* value, TaggedToFloat64ConversionType conversion_type);
+      ValueNode* value, TaggedToFloat64ConversionType conversion_type) {
+    return reducer_.TryGetFloat64Constant(value, conversion_type);
+  }
+
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  std::optional<double> TryGetHoleyFloat64Constant(ValueNode* value);
+#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
 
   // Get a Float64 representation node whose value is equivalent to the given
   // node.
   //
   // Deopts if the value is not exactly representable as a Float64.
-  ValueNode* GetFloat64(ValueNode* value);
+  ValueNode* GetFloat64(ValueNode* value) { return reducer_.GetFloat64(value); }
 
   ValueNode* GetFloat64(interpreter::Register reg) {
     return GetFloat64(current_interpreter_frame_.get(reg));
   }
+
+  ValueNode* GetHoleyFloat64(ValueNode* value, bool convert_hole_to_undefined);
 
   // Get a Float64 representation node whose value is the result of ToNumber on
   // the given node. Only trivial ToNumber is allowed -- values that are already
@@ -1655,7 +1547,10 @@ class MaglevGraphBuilder {
   // the ToNumber is non-trivial.
   ValueNode* GetFloat64ForToNumber(
       ValueNode* value, NodeType allowed_input_type,
-      TaggedToFloat64ConversionType conversion_type);
+      TaggedToFloat64ConversionType conversion_type) {
+    return reducer_.GetFloat64ForToNumber(value, allowed_input_type,
+                                          conversion_type);
+  }
 
   ValueNode* GetFloat64ForToNumber(
       interpreter::Register reg, NodeType allowed_input_type,
@@ -1766,7 +1661,7 @@ class MaglevGraphBuilder {
     DCHECK(interpreter::Bytecodes::ClobbersAccumulator(
         iterator_.current_bytecode()));
     current_interpreter_frame_.set_accumulator(
-        GetRootConstant(RootIndex::kOptimizedOut));
+        graph()->GetRootConstant(RootIndex::kOptimizedOut));
   }
 
   ValueNode* GetSecondValue(ValueNode* result) {
@@ -1783,7 +1678,7 @@ class MaglevGraphBuilder {
       DCHECK_EQ(result->opcode(), Opcode::kForInPrepare);
     }
     // {result} must be the last node in the current block.
-    DCHECK_EQ(node_buffer().back(), result);
+    // DCHECK_EQ(node_buffer().back(), result);
     return AddNewNode<GetSecondReturnedValue>({});
   }
 
@@ -1841,7 +1736,6 @@ class MaglevGraphBuilder {
                    value->lazy_deopt_info()->IsResultRegister(target1));
   }
 
-  std::pair<interpreter::Register, int> GetResultLocationAndSize() const;
 #ifdef DEBUG
   bool HasOutputRegister(interpreter::Register reg) const;
 #endif
@@ -1850,78 +1744,10 @@ class MaglevGraphBuilder {
   DeoptFrame* GetDeoptFrameForEagerCall(const MaglevCompilationUnit* unit,
                                         ValueNode* closure,
                                         base::Vector<ValueNode*> args);
-  DeoptFrame GetDeoptFrameForLazyDeopt(interpreter::Register result_location,
-                                       int result_size);
   DeoptFrame GetDeoptFrameForLazyDeoptHelper(
       interpreter::Register result_location, int result_size,
       DeoptFrameScope* scope, bool mark_accumulator_dead);
   InterpretedDeoptFrame GetDeoptFrameForEntryStackCheck();
-
-  template <typename NodeT>
-  void MarkPossibleSideEffect(NodeT* node) {
-    if constexpr (NodeT::kProperties.can_read() ||
-                  NodeT::kProperties.can_deopt() ||
-                  NodeT::kProperties.can_throw()) {
-      unobserved_context_slot_stores_.clear();
-    }
-
-    if constexpr (Node::opcode_of<NodeT> != Opcode::kAllocationBlock &&
-                  (NodeT::kProperties.can_deopt() ||
-                   NodeT::kProperties.can_throw() ||
-                   NodeT::kProperties.can_allocate())) {
-      ClearCurrentAllocationBlock();
-    }
-
-    // Don't do anything for nodes without side effects.
-    if constexpr (!NodeT::kProperties.can_write()) return;
-
-    if (v8_flags.maglev_cse) {
-      known_node_aspects().increment_effect_epoch();
-    }
-
-    // We only need to clear unstable node aspects on the current builder, not
-    // the parent, since we'll anyway copy the known_node_aspects to the parent
-    // once we finish the inlined function.
-
-    if constexpr (IsElementsArrayWrite(Node::opcode_of<NodeT>)) {
-      node->ClearElementsProperties(known_node_aspects());
-      if (is_loop_effect_tracking()) {
-        loop_effects_->keys_cleared.insert(
-            KnownNodeAspects::LoadedPropertyMapKey::Elements());
-      }
-    } else if constexpr (!IsSimpleFieldStore(Node::opcode_of<NodeT>) &&
-                         !IsTypedArrayStore(Node::opcode_of<NodeT>)) {
-      // Don't change known node aspects for simple field stores. The only
-      // relevant side effect on these is writes to objects which invalidate
-      // loaded properties and context slots, and we invalidate these already as
-      // part of emitting the store.
-      node->ClearUnstableNodeAspects(known_node_aspects());
-      if (is_loop_effect_tracking()) {
-        loop_effects_->unstable_aspects_cleared = true;
-      }
-    }
-
-    // Simple field stores can't possibly change or migrate the map.
-    static constexpr bool is_possible_map_change =
-        !IsSimpleFieldStore(Node::opcode_of<NodeT>);
-
-    // All user-observable side effects need to clear state that is cached on
-    // the builder. This reset has to be propagated up through the parents.
-    // TODO(leszeks): What side effects aren't observable? Maybe migrations?
-    ResetBuilderCachedState<is_possible_map_change>();
-  }
-
-  template <bool is_possible_map_change = true>
-  void ResetBuilderCachedState() {
-    latest_checkpointed_frame_.reset();
-
-    // If a map might have changed, then we need to re-check it for for-in.
-    // TODO(leszeks): Track this on merge states / known node aspects, rather
-    // than on the graph, so that it can survive control flow.
-    if constexpr (is_possible_map_change) {
-      current_for_in_state.receiver_needs_map_check = true;
-    }
-  }
 
   int next_offset() const {
     return iterator_.current_offset() + iterator_.current_bytecode_size();
@@ -1946,15 +1772,15 @@ class MaglevGraphBuilder {
   void StartNewBlock(BasicBlock* predecessor,
                      MergePointInterpreterFrameState* merge_state,
                      BasicBlockRef& refs_to_block) {
-    DCHECK_NULL(current_block_);
-    current_block_ = zone()->New<BasicBlock>(merge_state, zone());
+    DCHECK_NULL(current_block());
+    set_current_block(zone()->New<BasicBlock>(merge_state, zone()));
     if (merge_state == nullptr) {
       DCHECK_NOT_NULL(predecessor);
-      current_block_->set_predecessor(predecessor);
+      current_block()->set_predecessor(predecessor);
     } else {
-      merge_state->InitializeWithBasicBlock(current_block_);
+      merge_state->InitializeWithBasicBlock(current_block());
     }
-    refs_to_block.Bind(current_block_);
+    refs_to_block.Bind(current_block());
   }
 
   template <UseReprHintRecording hint = UseReprHintRecording::kRecord>
@@ -2003,15 +1829,6 @@ class MaglevGraphBuilder {
     }
   }
 
-  void FlushNodesToBlock() {
-    ZoneVector<Node*>& nodes = current_block_->nodes();
-    size_t old_size = nodes.size();
-    nodes.resize(old_size + node_buffer().size());
-    std::copy(node_buffer().begin(), node_buffer().end(),
-              nodes.begin() + old_size);
-    node_buffer().clear();
-  }
-
   template <typename ControlNodeT, typename... Args>
   BasicBlock* FinishBlock(std::initializer_list<ValueNode*> control_inputs,
                           Args&&... args) {
@@ -2023,8 +1840,8 @@ class MaglevGraphBuilder {
     static_assert(!ControlNodeT::kProperties.can_lazy_deopt());
     static_assert(!ControlNodeT::kProperties.can_throw());
     static_assert(!ControlNodeT::kProperties.can_write());
-    control_node->set_owner(current_block_);
-    current_block_->set_control_node(control_node);
+    control_node->set_owner(current_block());
+    current_block()->set_control_node(control_node);
     // Clear unobserved context slot stores when there is any controlflow.
     // TODO(olivf): More precision could be achieved by tracking dominating
     // stores within known_node_aspects. For this we could use a stack of
@@ -2034,15 +1851,13 @@ class MaglevGraphBuilder {
     // TODO(olivf): Support allocation folding across control flow.
     ClearCurrentAllocationBlock();
 
-    BasicBlock* block = current_block_;
-    FlushNodesToBlock();
-    current_block_ = nullptr;
+    BasicBlock* block = current_block();
+    reducer_.FlushNodesToBlock();
+    set_current_block(nullptr);
 
     graph()->Add(block);
     if (has_graph_labeller()) {
-      graph_labeller()->RegisterNode(control_node, compilation_unit_,
-                                     BytecodeOffset(iterator_.current_offset()),
-                                     current_source_position_);
+      graph_labeller()->RegisterNode(control_node);
       if (v8_flags.trace_maglev_graph_building) {
         bool kSkipTargets = true;
         std::cout << "  " << control_node << "  "
@@ -2059,7 +1874,7 @@ class MaglevGraphBuilder {
     // which case we merge our state into it. That merge-point could also be a
     // loop header, in which case the merge state might not exist yet (if the
     // only predecessors are this path and the JumpLoop).
-    DCHECK_NULL(current_block_);
+    DCHECK_NULL(current_block());
 
     if (predecessor_count(next_block_offset) == 1) {
       if (v8_flags.trace_maglev_graph_building) {
@@ -2098,6 +1913,10 @@ class MaglevGraphBuilder {
                                           ExternalArrayType type,
                                           Function&& getValue);
 
+  MaybeReduceResult TryReduceDatePrototypeGetField(
+      compiler::JSFunctionRef target, CallArguments& args,
+      JSDate::FieldIndex field);
+
 #ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
 #define CONTINUATION_PRESERVED_EMBEDDER_DATA_LIST(V) \
   V(GetContinuationPreservedEmbedderData)            \
@@ -2125,6 +1944,13 @@ class MaglevGraphBuilder {
   V(DataViewPrototypeSetInt32)                 \
   V(DataViewPrototypeGetFloat64)               \
   V(DataViewPrototypeSetFloat64)               \
+  V(DatePrototypeGetFullYear)                  \
+  V(DatePrototypeGetMonth)                     \
+  V(DatePrototypeGetDate)                      \
+  V(DatePrototypeGetDay)                       \
+  V(DatePrototypeGetHours)                     \
+  V(DatePrototypeGetMinutes)                   \
+  V(DatePrototypeGetSeconds)                   \
   V(FunctionPrototypeApply)                    \
   V(FunctionPrototypeCall)                     \
   V(FunctionPrototypeHasInstance)              \
@@ -2139,9 +1965,11 @@ class MaglevGraphBuilder {
   V(MathPow)                                   \
   V(MathAbs)                                   \
   V(MathRound)                                 \
+  V(MathClz32)                                 \
   V(SetPrototypeHas)                           \
   V(StringConstructor)                         \
   V(StringFromCharCode)                        \
+  V(StringPrototypeCharAt)                     \
   V(StringPrototypeCharCodeAt)                 \
   V(StringPrototypeCodePointAt)                \
   V(StringPrototypeIterator)                   \
@@ -2172,6 +2000,14 @@ class MaglevGraphBuilder {
       const std::optional<InitialCallback>& initial_callback = {},
       const std::optional<ProcessElementCallback>& process_element_callback =
           {});
+
+  // OOB StringAt access behaves differently for elements (needs the elements
+  // protector, positive indices, and returns undefined) and charAt (allows
+  // negative indices, returns empty string).
+  enum class StringAtOOBMode { kElement, kCharAt };
+  MaybeReduceResult TryReduceConstantStringAt(ValueNode* object,
+                                              ValueNode* index,
+                                              StringAtOOBMode oob_mode);
 
   MaybeReduceResult TryReduceGetProto(ValueNode* node);
 
@@ -2348,23 +2184,32 @@ class MaglevGraphBuilder {
       ValueNode* this_function, ValueNode* new_target,
       std::pair<interpreter::Register, interpreter::Register> result);
 
-  ValueNode* BuildSmiUntag(ValueNode* node);
+  ValueNode* BuildSmiUntag(ValueNode* node) {
+    return reducer_.BuildSmiUntag(node);
+  }
   ValueNode* BuildNumberOrOddballToFloat64(
       ValueNode* node, NodeType allowed_input_type,
-      TaggedToFloat64ConversionType conversion_type);
+      TaggedToFloat64ConversionType conversion_type) {
+    return reducer_.BuildNumberOrOddballToFloat64(node, allowed_input_type,
+                                                  conversion_type);
+  }
 
   ReduceResult BuildCheckSmi(ValueNode* object, bool elidable = true);
   ReduceResult BuildCheckNumber(ValueNode* object);
   ReduceResult BuildCheckHeapObject(ValueNode* object);
+  ReduceResult BuildCheckJSFunction(ValueNode* object);
   ReduceResult BuildCheckJSReceiver(ValueNode* object);
   ReduceResult BuildCheckJSReceiverOrNullOrUndefined(ValueNode* object);
+  ReduceResult BuildCheckSeqOneByteString(ValueNode* object);
   ReduceResult BuildCheckString(ValueNode* object);
   ReduceResult BuildCheckStringOrStringWrapper(ValueNode* object);
+  ReduceResult BuildCheckStringOrOddball(ValueNode* object);
   ReduceResult BuildCheckSymbol(ValueNode* object);
   ReduceResult BuildCheckMaps(
       ValueNode* object, base::Vector<const compiler::MapRef> maps,
       std::optional<ValueNode*> map = {},
-      bool has_deprecated_map_without_migration_target = false);
+      bool has_deprecated_map_without_migration_target = false,
+      bool migration_done_outside = false);
   ReduceResult BuildTransitionElementsKindOrCheckMap(
       ValueNode* heap_object, ValueNode* object_map,
       const ZoneVector<compiler::MapRef>& transition_sources,
@@ -2515,6 +2360,9 @@ class MaglevGraphBuilder {
                                     NodeType length_type = NodeType::kSmi);
   ValueNode* BuildLoadElements(ValueNode* object);
 
+  ValueNode* BuildLoadJSFunctionFeedbackCell(ValueNode* closure);
+  ValueNode* BuildLoadJSFunctionContext(ValueNode* closure);
+
   MaybeReduceResult TryBuildCheckInt32Condition(
       ValueNode* lhs, ValueNode* rhs, AssertCondition condition,
       DeoptimizeReason reason, bool allow_unconditional_deopt = true);
@@ -2562,6 +2410,7 @@ class MaglevGraphBuilder {
 
   MaybeReduceResult TryBuildElementAccessOnString(
       ValueNode* object, ValueNode* index,
+      const compiler::ElementAccessFeedback& access_info,
       compiler::KeyedAccessMode const& keyed_mode);
   MaybeReduceResult TryBuildElementAccessOnTypedArray(
       ValueNode* object, ValueNode* index,
@@ -2598,6 +2447,15 @@ class MaglevGraphBuilder {
       compiler::AccessMode access_mode,
       const ZoneVector<compiler::PropertyAccessInfo>& access_infos,
       GenericAccessFunc&& build_generic_access);
+
+  struct ContinuationOffsets {
+    int last_continuation;
+    int after_continuation;
+  };
+  std::optional<ContinuationOffsets>
+  FindContinuationForPolymorphicPropertyLoad();
+  void BuildContinuationForPolymorphicPropertyLoad(
+      const ContinuationOffsets& offsets);
 
   // Load elimination -- when loading or storing a simple property without
   // side effects, record its value, and allow that value to be reused on
@@ -2757,6 +2615,8 @@ class MaglevGraphBuilder {
   template <Operation kOperation>
   MaybeReduceResult TryFoldInt32BinaryOperation(ValueNode* left,
                                                 int32_t cst_right);
+  template <Operation kOperation>
+  MaybeReduceResult TryFoldInt32BinaryOperation(int32_t left, int32_t right);
 
   template <Operation kOperation>
   ReduceResult BuildInt32UnaryOperationNode();
@@ -2808,7 +2668,6 @@ class MaglevGraphBuilder {
   template <Operation kOperation>
   ReduceResult VisitBinarySmiOperation();
 
-  ValueNode* BuildUnwrapThinString(ValueNode* input);
   ValueNode* BuildUnwrapStringWrapper(ValueNode* input);
   ReduceResult BuildStringConcat(ValueNode* left, ValueNode* right);
   ValueNode* BuildNewConsStringMap(ValueNode* left, ValueNode* right);
@@ -2994,6 +2853,10 @@ class MaglevGraphBuilder {
                                                  ValueNode* node);
   BranchResult BuildBranchIfFloat64IsHole(BranchBuilder& builder,
                                           ValueNode* node);
+#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+  BranchResult BuildBranchIfFloat64IsUndefinedOrHole(BranchBuilder& builder,
+                                                     ValueNode* node);
+#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
   BranchResult BuildBranchIfReferenceEqual(BranchBuilder& builder,
                                            ValueNode* lhs, ValueNode* rhs);
   BranchResult BuildBranchIfInt32Compare(BranchBuilder& builder, Operation op,
@@ -3130,9 +2993,6 @@ class MaglevGraphBuilder {
   int parameter_count() const { return compilation_unit_->parameter_count(); }
   int parameter_count_without_receiver() const { return parameter_count() - 1; }
   int register_count() const { return compilation_unit_->register_count(); }
-  KnownNodeAspects& known_node_aspects() {
-    return *current_interpreter_frame_.known_node_aspects();
-  }
 
   float GetCurrentCallFrequency() {
     if (!is_inline()) return 1.0f;
@@ -3167,6 +3027,8 @@ class MaglevGraphBuilder {
     DCHECK(is_inline());
     return bytecode().length();
   }
+
+  MaglevReducer<MaglevGraphBuilder> reducer_;
 
   LocalIsolate* const local_isolate_;
   MaglevCompilationUnit* const compilation_unit_;
@@ -3231,6 +3093,10 @@ class MaglevGraphBuilder {
     return peeled_iteration_count_ > 0;
   }
 
+  compiler::FeedbackSource current_speculation_feedback() {
+    return reducer_.current_speculation_feedback();
+  }
+
   // When loop SPeeling is enabled then the second-last peeling iteration
   // is the optimistic iteration. At the end we try to compile the JumpLoop and
   // only proceed with the fallback iteration 0, if the loop state is
@@ -3256,10 +3122,8 @@ class MaglevGraphBuilder {
 
   // Current block information.
   bool in_prologue_ = true;
-  BasicBlock* current_block_ = nullptr;
   std::optional<InterpretedDeoptFrame> entry_stack_check_frame_;
   std::optional<DeoptFrame> latest_checkpointed_frame_;
-  SourcePosition current_source_position_;
   struct ForInState {
     ValueNode* receiver = nullptr;
     ValueNode* cache_type = nullptr;
@@ -3277,7 +3141,8 @@ class MaglevGraphBuilder {
   MergePointInterpreterFrameState** merge_states_;
 
   InterpreterFrameState current_interpreter_frame_;
-  compiler::FeedbackSource current_speculation_feedback_;
+  SpeculationMode current_speculation_mode_ =
+      SpeculationMode::kDisallowSpeculation;
 
   ValueNode* inlined_new_target_ = nullptr;
 
@@ -3361,7 +3226,14 @@ class MaglevGraphBuilder {
   }
 
   bool CanSpeculateCall() const {
-    return current_speculation_feedback_.IsValid();
+    return current_speculation_mode_ == SpeculationMode::kAllowSpeculation;
+  }
+
+  bool CanSpeculateCall(
+      std::initializer_list<SpeculationMode> supported_modes) const {
+    return CanSpeculateCall() ||
+           std::find(supported_modes.begin(), supported_modes.end(),
+                     current_speculation_mode_) != supported_modes.end();
   }
 
   inline void MarkNodeDead(Node* node) {
